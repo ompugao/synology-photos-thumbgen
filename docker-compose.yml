@@ -1,0 +1,12 @@
+services:
+  thumbgen:
+    build: .
+    image: synology-photos-thumbgen:latest
+    container_name: synology-photos-thumbgen
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-100}"
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ${PHOTOS_HOST_DIR:?Set PHOTOS_HOST_DIR in .env}:/photos:ro
+      - ./data:/data

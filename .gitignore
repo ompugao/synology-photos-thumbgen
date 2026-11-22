@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+compose.override.yaml
+compose.override.yml
+data/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
