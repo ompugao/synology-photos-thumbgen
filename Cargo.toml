@@ -1,0 +1,23 @@
+[package]
+name = "synology-photos-thumbgen"
+version = "0.2.0"
+edition = "2021"
+description = "Automatic preview thumbnail generator for Synology Photos using ffmpeg, libheif-tools, and Linux inotify"
+
+[[bin]]
+name = "synology-thumbgen"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,23 +1,18 @@
-FROM python:3.12-slim
-
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tzdata \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
-
-COPY README.md ./
+FROM rust:alpine AS builder
+RUN apk add --no-cache musl-dev
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release \
+    && rm -rf src target/release/deps/synology_thumbgen* target/release/synology_photos_thumbgen* target/release/synology-thumbgen*
 COPY src ./src
-RUN uv sync --frozen --no-dev
+RUN rm -rf target/release/.fingerprint/synology* target/release/deps/synology* target/release/synology* \
+    && touch src/main.rs \
+    && cargo build --release --locked
 
-ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1 \
-    HOME=/tmp
-
+FROM alpine:latest
+RUN apk add --no-cache ffmpeg libheif-tools tzdata ca-certificates
+COPY --from=builder /build/target/release/synology-thumbgen /usr/local/bin/synology-thumbgen
+ENV HOME=/tmp
 ENTRYPOINT ["synology-thumbgen"]
 CMD ["daemon"]
