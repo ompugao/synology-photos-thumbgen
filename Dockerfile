@@ -14,5 +14,7 @@ FROM alpine:latest
 RUN apk add --no-cache ffmpeg libheif-tools tzdata ca-certificates
 COPY --from=builder /build/target/release/synology-thumbgen /usr/local/bin/synology-thumbgen
 ENV HOME=/tmp
+HEALTHCHECK --interval=60s --timeout=5s --start-period=30s --retries=1 \
+    CMD ["synology-thumbgen", "healthcheck"]
 ENTRYPOINT ["synology-thumbgen"]
 CMD ["daemon"]

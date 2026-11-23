@@ -8,7 +8,7 @@ Synology Photos（Personal Space）でサムネイル未生成の HEVC 動画（
 - **ローカル高速読み取り**: ホストの写真ディレクトリ（`PHOTOS_HOST_DIR`、例: `/volume1/homes/<username>/Photos`）を読み取り専用（`:ro`）でマウントし、ローカルから直接 1 フレーム抽出するため数 GB の動画を HTTP ダウンロードしません。
 - **サムネイルのみ生成**: 省容量・高速処理のため、H.264 動画の再エンコード（`film_h264`）は行いません。
 - **inotify リアルタイム検知＋保険ポーリング**: `/photos` 配下（`@eaDir` 等を除く）を Linux `inotify` で監視し、`WATCH_EXTENSIONS`（既定は動画＋HEIC/HEIF のみ、`.jpg`/`.png` 除外）の新規追加後すぐ（デバウンス 15 秒＋必要に応じ 45 秒後に追確認）処理します。取りこぼし防止の定期チェックも 1800 秒（30 分）おきに併用します。
-- **2FA（OTP）対応・Auto Block 保護**: 認証エラー時は再試行せず即時停止します。2FA 有効時は初回 `auth` で `device_id` を `./data/state.json` に保存します。
+- **2FA（OTP）対応・Auto Block 保護**: パスワード変更や OTP 失効などの認証エラー時は、`auth_failed` マーカーを記録して Docker `HEALTHCHECK` を `unhealthy` にし、設定されていれば Webhook（Discord / Slack / ntfy / 汎用 JSON）で 1 回だけ通知したうえでコンテナを再起動ループさせず安全に待機停止します。2FA 有効時は初回 `auth` で `device_id` を `./data/state.json` に保存します。
 
 ## セットアップ手順
 
@@ -46,4 +46,24 @@ Synology Photos（Personal Space）でサムネイル未生成の HEVC 動画（
 DSM に接続せずローカルファイル単体でサムネイル生成を確認できます。
 ```bash
 docker compose run --rm thumbgen test-local /photos/path/to/video.mp4
+```
+
+## 認証エラー時の Webhook 通知（任意）
+
+`.env` に `NOTIFY_WEBHOOK_URL` を設定すると、DSM へのログインが失敗したタイミング（パスワード変更・OTP 失効時など）で通知を受け取れます。URL から Discord / Slack / ntfy / 汎用 JSON を自動判定します（`NOTIFY_WEBHOOK_FORMAT` で明示指定も可能、Bearer 認証が必要なら `NOTIFY_WEBHOOK_TOKEN` を設定）。
+
+```env
+# 例: ntfy.sh / Discord / Slack いずれかの URL を 1 つ設定
+NOTIFY_WEBHOOK_URL=https://ntfy.sh/your-secret-topic
+NOTIFY_WEBHOOK_FORMAT=auto
+```
+
+疎通確認と復旧コマンド:
+```bash
+# Webhook のテスト送信
+docker compose run --rm thumbgen test-notify
+
+# 認証エラーで停止（unhealthy）になった場合の復旧
+docker compose run --rm thumbgen auth
+docker compose restart
 ```

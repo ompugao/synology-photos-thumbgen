@@ -1,13 +1,83 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const BASE_BACKOFF_SECONDS: u64 = 300;
 pub const MAX_BACKOFF_SECONDS: u64 = 86400;
+
+fn write_atomic_private(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed creating {}: {e}", parent.display()))?;
+
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(".tmp-{pid}-{nanos}"));
+
+    let write_res = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("Failed saving {}: {err}", path.display()));
+    }
+    Ok(())
+}
+
+pub fn auth_failed_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("auth_failed")
+}
+
+#[derive(Serialize)]
+struct AuthFailedPayload<'a> {
+    timestamp: f64,
+    reason: &'a str,
+}
+
+pub fn mark_auth_failed(data_dir: &Path, reason: &str) -> Result<(), String> {
+    let payload = AuthFailedPayload {
+        timestamp: now_unix_secs(),
+        reason,
+    };
+    let mut json = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("Failed serializing auth_failed marker: {e}"))?;
+    json.push('\n');
+    write_atomic_private(&auth_failed_path(data_dir), json.as_bytes())
+}
+
+pub fn clear_auth_failed(data_dir: &Path) {
+    let path = auth_failed_path(data_dir);
+    if let Err(err) = fs::remove_file(&path) {
+        if err.kind() != io::ErrorKind::NotFound {
+            // Best-effort cleanup
+        }
+    }
+}
+
+pub fn is_auth_failed(data_dir: &Path) -> bool {
+    auth_failed_path(data_dir).exists()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailedUnit {
@@ -57,14 +127,6 @@ impl StateStore {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let parent = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed creating {}: {e}", parent.display()))?;
-
         let payload = StatePayload {
             device_id: self.device_id.clone(),
             failed_units: self.failed_units.clone(),
@@ -72,33 +134,7 @@ impl StateStore {
         let mut json = serde_json::to_string_pretty(&payload)
             .map_err(|e| format!("Failed serializing state: {e}"))?;
         json.push('\n');
-
-        let pid = std::process::id();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp_path = parent.join(format!(".state-{pid}-{nanos}.tmp"));
-
-        let write_res = (|| -> std::io::Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
-            fs::rename(&tmp_path, &self.path)?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_res {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!("Failed saving {}: {err}", self.path.display()));
-        }
-        Ok(())
+        write_atomic_private(&self.path, json.as_bytes())
     }
 
     pub fn set_device_id(&mut self, device_id: Option<String>) -> Result<(), String> {
@@ -203,6 +239,23 @@ mod tests {
 
         reloaded.clear_failure(42).unwrap();
         assert!(!reloaded.should_skip_at(42, 2001.0));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_auth_failed_marker_write_check_and_clear() {
+        let dir = temp_state_dir("auth_failed");
+        assert!(!is_auth_failed(&dir));
+
+        mark_auth_failed(&dir, "DSM authentication failed (code=403)").unwrap();
+        assert!(is_auth_failed(&dir));
+        let mode = fs::metadata(auth_failed_path(&dir)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        clear_auth_failed(&dir);
+        assert!(!is_auth_failed(&dir));
+        clear_auth_failed(&dir); // idempotent when already missing
 
         let _ = fs::remove_dir_all(dir);
     }

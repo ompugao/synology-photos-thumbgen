@@ -26,6 +26,9 @@ pub struct Settings {
     pub heif_convert_bin: String,
     pub log_level: String,
     pub device_name: String,
+    pub notify_webhook_url: Option<String>,
+    pub notify_webhook_format: String,
+    pub notify_webhook_token: Option<String>,
 }
 
 impl Default for Settings {
@@ -77,6 +80,13 @@ fn get_non_empty(map: &HashMap<String, String>, key: &str, default: &str) -> Str
     }
 }
 
+fn get_optional(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    map.get(key)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+}
+
 impl Settings {
     pub fn from_env() -> Result<Self, String> {
         let map: HashMap<String, String> = env::vars().collect();
@@ -124,6 +134,10 @@ impl Settings {
             heif_convert_bin: get_non_empty(src, "HEIF_CONVERT_BIN", "heif-convert"),
             log_level: get_non_empty(src, "LOG_LEVEL", "INFO").to_ascii_uppercase(),
             device_name: get_non_empty(src, "DSM_DEVICE_NAME", "SynologyPhotosThumbGen"),
+            notify_webhook_url: get_optional(src, "NOTIFY_WEBHOOK_URL"),
+            notify_webhook_format: get_non_empty(src, "NOTIFY_WEBHOOK_FORMAT", "auto")
+                .to_ascii_lowercase(),
+            notify_webhook_token: get_optional(src, "NOTIFY_WEBHOOK_TOKEN"),
         })
     }
 }
@@ -160,5 +174,21 @@ mod tests {
         assert!(s_override.watch_extensions.contains("mp4"));
         assert!(s_override.watch_extensions.contains("jpg"));
         assert!(s_override.watch_extensions.contains("heic"));
+
+        assert!(s_default.notify_webhook_url.is_none());
+        assert_eq!(s_default.notify_webhook_format, "auto");
+        assert!(s_default.notify_webhook_token.is_none());
+
+        let mut env_notify = HashMap::new();
+        env_notify.insert("NOTIFY_WEBHOOK_URL".into(), " https://ntfy.sh/test-topic ".into());
+        env_notify.insert("NOTIFY_WEBHOOK_FORMAT".into(), "NTFY".into());
+        env_notify.insert("NOTIFY_WEBHOOK_TOKEN".into(), " secret-tok ".into());
+        let s_notify = Settings::from_env_map(&env_notify).unwrap();
+        assert_eq!(
+            s_notify.notify_webhook_url.as_deref(),
+            Some("https://ntfy.sh/test-topic")
+        );
+        assert_eq!(s_notify.notify_webhook_format, "ntfy");
+        assert_eq!(s_notify.notify_webhook_token.as_deref(), Some("secret-tok"));
     }
 }

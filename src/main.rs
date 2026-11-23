@@ -2,6 +2,7 @@ mod config;
 mod dsm_client;
 mod log;
 mod media;
+mod notify;
 mod state;
 mod watcher;
 
@@ -27,6 +28,8 @@ enum CliCommand {
     Once { dry_run: bool, limit: Option<usize> },
     Auth,
     TestLocal { file: PathBuf, out_dir: Option<PathBuf> },
+    TestNotify,
+    Healthcheck,
     Help,
 }
 
@@ -330,37 +333,40 @@ fn cmd_once(settings: &Settings, dry_run: bool, limit: Option<usize>) -> i32 {
     let mut client = DsmPhotosClient::new(settings.clone(), state.device_id.clone());
 
     let code = match client.login(&mut state, None) {
-        Ok(_) => match run_cycle_with_reauth(
-            &mut client,
-            &mut resolver,
-            &mut state,
-            settings,
-            dry_run,
-            limit,
-        ) {
-            Ok(stats) => {
-                log_info!(
-                    "Cycle complete: processed={} succeeded={} failed={} skipped={}",
-                    stats.processed,
-                    stats.succeeded,
-                    stats.failed,
-                    stats.skipped
-                );
-                0
-            }
-            Err(DsmError::AuthFatal { requires_otp, message, .. }) => {
-                log_error!("{}", message);
-                if requires_otp {
-                    log_error!("2FA is enabled. Run `docker compose run --rm thumbgen auth` once.");
+        Ok(_) => {
+            state::clear_auth_failed(&settings.data_dir);
+            match run_cycle_with_reauth(
+                &mut client,
+                &mut resolver,
+                &mut state,
+                settings,
+                dry_run,
+                limit,
+            ) {
+                Ok(stats) => {
+                    log_info!(
+                        "Cycle complete: processed={} succeeded={} failed={} skipped={}",
+                        stats.processed,
+                        stats.succeeded,
+                        stats.failed,
+                        stats.skipped
+                    );
+                    0
                 }
-                2
+                Err(DsmError::AuthFatal { requires_otp, message }) => {
+                    log_error!("{}", message);
+                    if requires_otp {
+                        log_error!("2FA is enabled. Run `docker compose run --rm thumbgen auth` once.");
+                    }
+                    2
+                }
+                Err(err) => {
+                    log_error!("Cycle failed: {}", err);
+                    1
+                }
             }
-            Err(err) => {
-                log_error!("Cycle failed: {}", err);
-                1
-            }
-        },
-        Err(DsmError::AuthFatal { requires_otp, message, .. }) => {
+        }
+        Err(DsmError::AuthFatal { requires_otp, message }) => {
             log_error!("{}", message);
             if requires_otp {
                 log_error!("2FA is enabled. Run `docker compose run --rm thumbgen auth` once.");
@@ -397,9 +403,61 @@ fn spawn_signal_watcher(
     }
 }
 
+fn park_until_signal(stop_flag: &AtomicBool, schedule: &(Mutex<DaemonSchedule>, Condvar)) {
+    let (lock, cv) = schedule;
+    let guard = lock.lock().unwrap();
+    let _unused = cv
+        .wait_while(guard, |_| !stop_flag.load(Ordering::SeqCst))
+        .unwrap();
+}
+
+fn enter_auth_failed_park(
+    settings: &Settings,
+    reason: &str,
+    requires_otp: bool,
+    stop_flag: &AtomicBool,
+    schedule: &(Mutex<DaemonSchedule>, Condvar),
+) {
+    log_error!("{}", reason);
+    if requires_otp {
+        log_error!(
+            "2FA is enabled. Run `docker compose run --rm thumbgen auth && docker compose restart`."
+        );
+    } else {
+        log_error!("Check DSM_USERNAME / DSM_PASSWORD in .env, then run `docker compose restart`.");
+    }
+    if let Err(err) = state::mark_auth_failed(&settings.data_dir, reason) {
+        log_warn!("Failed writing auth_failed marker: {}", err);
+    }
+    notify::notify_auth_failure(settings, reason, requires_otp);
+    log_warn!(
+        "Daemon paused (no further login attempts will be made to protect against DSM Auto Block)."
+    );
+    park_until_signal(stop_flag, schedule);
+}
+
 fn cmd_daemon(settings: &Settings) -> i32 {
-    if !validate_credentials(settings) {
-        return 2;
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let schedule = Arc::new((
+        Mutex::new(DaemonSchedule {
+            pending_event_at: None,
+            last_event_log_at: None,
+            suppressed_event_count: 0,
+            followup_due_at: None,
+        }),
+        Condvar::new(),
+    ));
+    spawn_signal_watcher(Arc::clone(&stop_flag), Arc::clone(&schedule));
+
+    if settings.dsm_username.is_empty() || settings.dsm_password.is_empty() {
+        enter_auth_failed_park(
+            settings,
+            "DSM_USERNAME or DSM_PASSWORD is empty. Set both in .env before running.",
+            false,
+            &stop_flag,
+            &schedule,
+        );
+        return 0;
     }
 
     let mut state = match StateStore::load(settings.data_dir.join("state.json")) {
@@ -412,33 +470,26 @@ fn cmd_daemon(settings: &Settings) -> i32 {
     let mut resolver = LocalMediaResolver::new(settings.photos_dir.clone());
     let mut client = DsmPhotosClient::new(settings.clone(), state.device_id.clone());
 
-    if let Err(err) = client.login(&mut state, None) {
-        match err {
-            DsmError::AuthFatal { requires_otp, message, .. } => {
-                log_error!("{}", message);
-                if requires_otp {
-                    log_error!("2FA is enabled. Run `docker compose run --rm thumbgen auth` once.");
-                }
-                return 2;
-            }
-            other => {
-                log_error!("Initial login failed: {}", other);
-                return 1;
-            }
+    let mut initial_login_transient_fail = false;
+    match client.login(&mut state, None) {
+        Ok(_) => {
+            state::clear_auth_failed(&settings.data_dir);
+        }
+        Err(DsmError::AuthFatal {
+            requires_otp,
+            message,
+        }) => {
+            enter_auth_failed_park(settings, &message, requires_otp, &stop_flag, &schedule);
+            return 0;
+        }
+        Err(other) => {
+            log_warn!(
+                "Initial login failed ({}); will retry in 60s",
+                other
+            );
+            initial_login_transient_fail = true;
         }
     }
-
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let schedule = Arc::new((
-        Mutex::new(DaemonSchedule {
-            pending_event_at: None,
-            last_event_log_at: None,
-            suppressed_event_count: 0,
-            followup_due_at: None,
-        }),
-        Condvar::new(),
-    ));
-    spawn_signal_watcher(Arc::clone(&stop_flag), Arc::clone(&schedule));
 
     let mut watcher: Option<MediaInotifyWatcher> = None;
     if settings.watch_enabled && settings.photos_dir.exists() {
@@ -528,9 +579,12 @@ fn cmd_daemon(settings: &Settings) -> i32 {
     let poll_dur = Duration::from_secs(settings.poll_interval_seconds);
     let followup_dur = Duration::from_secs(settings.watch_followup_seconds);
 
-    let mut next_fallback_poll_at = Instant::now();
+    let mut next_fallback_poll_at = if initial_login_transient_fail {
+        Instant::now() + Duration::from_secs(60)
+    } else {
+        Instant::now()
+    };
     let mut initial_cycle_pending = true;
-    let mut exit_code = 0;
 
     while !stop_flag.load(Ordering::SeqCst) {
         let trigger = {
@@ -601,6 +655,7 @@ fn cmd_daemon(settings: &Settings) -> i32 {
             None,
         ) {
             Ok(stats) => {
+                state::clear_auth_failed(&settings.data_dir);
                 if stats.processed > 0 || stats.skipped > 0 || trigger != TriggerKind::FallbackPoll {
                     log_info!(
                         "Cycle complete ({}): processed={} succeeded={} failed={} skipped={}",
@@ -627,12 +682,12 @@ fn cmd_daemon(settings: &Settings) -> i32 {
                     }
                 }
             }
-            Err(DsmError::AuthFatal { requires_otp, message, .. }) => {
-                log_error!("Stopping daemon to prevent DSM Auto Block: {}", message);
-                if requires_otp {
-                    log_error!("Run `docker compose run --rm thumbgen auth` to refresh device token.");
+            Err(DsmError::AuthFatal { requires_otp, message }) => {
+                if let Some(mut w) = watcher.take() {
+                    w.stop();
                 }
-                exit_code = 2;
+                client.logout();
+                enter_auth_failed_park(settings, &message, requires_otp, &stop_flag, &schedule);
                 break;
             }
             Err(err) => {
@@ -646,7 +701,7 @@ fn cmd_daemon(settings: &Settings) -> i32 {
         w.stop();
     }
     client.logout();
-    exit_code
+    0
 }
 
 struct EchoGuard {
@@ -731,20 +786,23 @@ fn cmd_auth(settings: &Settings) -> i32 {
     let mut client = DsmPhotosClient::new(auth_settings, state.device_id.clone());
 
     let code = match client.login(&mut state, None) {
-        Ok(did) => match client.list_convert_needed() {
-            Ok(pending) => {
-                log_info!(
-                    "Authentication succeeded (device_id saved={}). Pending thumbnails visible now: {}",
-                    did.is_some(),
-                    pending.len()
-                );
-                0
+        Ok(did) => {
+            state::clear_auth_failed(&settings.data_dir);
+            match client.list_convert_needed() {
+                Ok(pending) => {
+                    log_info!(
+                        "Authentication succeeded (device_id saved={}). Pending thumbnails visible now: {}",
+                        did.is_some(),
+                        pending.len()
+                    );
+                    0
+                }
+                Err(err) => {
+                    log_error!("Authenticated, but list_convert_needed failed: {}", err);
+                    1
+                }
             }
-            Err(err) => {
-                log_error!("Authenticated, but list_convert_needed failed: {}", err);
-                1
-            }
-        },
+        }
         Err(DsmError::AuthFatal { requires_otp: true, .. }) => {
             let otp = match read_line_prompt("2FA OTP code: ", false) {
                 Ok(v) => v.trim().to_string(),
@@ -760,20 +818,23 @@ fn cmd_auth(settings: &Settings) -> i32 {
                 return 2;
             }
             match client.login(&mut state, Some(&otp)) {
-                Ok(did) => match client.list_convert_needed() {
-                    Ok(pending) => {
-                        log_info!(
-                            "Authentication succeeded (device_id saved={}). Pending thumbnails visible now: {}",
-                            did.is_some(),
-                            pending.len()
-                        );
-                        0
+                Ok(did) => {
+                    state::clear_auth_failed(&settings.data_dir);
+                    match client.list_convert_needed() {
+                        Ok(pending) => {
+                            log_info!(
+                                "Authentication succeeded (device_id saved={}). Pending thumbnails visible now: {}",
+                                did.is_some(),
+                                pending.len()
+                            );
+                            0
+                        }
+                        Err(err) => {
+                            log_error!("Authenticated, but list_convert_needed failed: {}", err);
+                            1
+                        }
                     }
-                    Err(err) => {
-                        log_error!("Authenticated, but list_convert_needed failed: {}", err);
-                        1
-                    }
-                },
+                }
                 Err(err) => {
                     log_error!("{}", err);
                     2
@@ -839,6 +900,42 @@ fn cmd_test_local(settings: &Settings, file_path: &Path, out_dir: Option<&Path>)
     }
 }
 
+fn cmd_test_notify(settings: &Settings) -> i32 {
+    if settings
+        .notify_webhook_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .is_none()
+    {
+        log_error!("NOTIFY_WEBHOOK_URL is not configured in .env.");
+        return 2;
+    }
+
+    match notify::send_webhook(
+        settings,
+        "synology-photos-thumbgen: test notification",
+        "Webhook notification is configured and working.",
+    ) {
+        Ok(fmt) => {
+            log_info!("Test notification sent successfully via {} webhook", fmt.as_str());
+            0
+        }
+        Err(err) => {
+            log_error!("{}", err);
+            1
+        }
+    }
+}
+
+fn cmd_healthcheck(settings: &Settings) -> i32 {
+    if state::is_auth_failed(&settings.data_dir) {
+        1
+    } else {
+        0
+    }
+}
+
 fn print_help() {
     println!(
         "Usage: synology-thumbgen <command> [options]\n\n\
@@ -846,7 +943,9 @@ fn print_help() {
            daemon                        Watch /photos via inotify and poll DSM periodically (default)\n  \
            once [--dry-run] [--limit N]  Run a single polling cycle and exit\n  \
            auth                          Interactive login to save 2FA device_id in state.json\n  \
-           test-local <file> [--out-dir <dir>]  Offline thumbnail extraction check on a local file"
+           test-local <file> [--out-dir <dir>]  Offline thumbnail extraction check on a local file\n  \
+           test-notify                   Send a test message using NOTIFY_WEBHOOK_URL\n  \
+           healthcheck                   Return 0 if healthy, 1 if paused due to auth failure"
     );
 }
 
@@ -920,6 +1019,24 @@ fn parse_args() -> Result<CliCommand, String> {
             let file = file.ok_or_else(|| "test-local requires <file>".to_string())?;
             Ok(CliCommand::TestLocal { file, out_dir })
         }
+        "test-notify" => {
+            if let Some(arg) = args.next() {
+                if arg == "-h" || arg == "--help" {
+                    return Ok(CliCommand::Help);
+                }
+                return Err(format!("Unexpected argument for test-notify: {arg}"));
+            }
+            Ok(CliCommand::TestNotify)
+        }
+        "healthcheck" => {
+            if let Some(arg) = args.next() {
+                if arg == "-h" || arg == "--help" {
+                    return Ok(CliCommand::Help);
+                }
+                return Err(format!("Unexpected argument for healthcheck: {arg}"));
+            }
+            Ok(CliCommand::Healthcheck)
+        }
         other => Err(format!("Unknown command: {other}")),
     }
 }
@@ -955,6 +1072,8 @@ fn main() {
         CliCommand::TestLocal { file, out_dir } => {
             cmd_test_local(&settings, &file, out_dir.as_deref())
         }
+        CliCommand::TestNotify => cmd_test_notify(&settings),
+        CliCommand::Healthcheck => cmd_healthcheck(&settings),
         CliCommand::Help => 0,
     };
 
